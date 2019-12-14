@@ -4,7 +4,9 @@ from jax.experimental import stax
 from jax.experimental.stax import Dense, Relu
 
 
-# probability distributions
+"""
+Probability utils
+"""
 def sample_n01(rng, shape):
     return random.normal(rng, shape)
 
@@ -15,14 +17,54 @@ def log_prob_n01(x):
     return np.sum(logpx, axis=-1)
 
 
-# flow interface: init_flow(rng, *paras):
-#     returns params, forward_fn, reverse_fn
-#
-# forward_fn(params, prev_sample, prev_logp):
-#     return this_sample, this_logp
-#
-# reverse_fn(params, next_sample, next_logp):
-#     return this_sample, this_logp
+"""
+Overview of flow interface
+
+flow interface: init_flow(rng, *params):
+    returns params, forward_fn, reverse_fn
+
+forward_fn(params, prev_sample, prev_logp):
+    return this_sample, this_logp
+
+reverse_fn(params, next_sample, next_logp):
+    return this_sample, this_logp
+"""
+
+
+"""
+Utils for chaining together flows
+"""
+def init_flow_chain(rng, init_fns, init_params, init_batch=None):
+    assert len(init_fns) == len(init_params)
+    p_chain, f_chain, r_chain = [], [], []
+    for init_fn, init_param in zip(init_fns, init_params):
+        rng, srng = random.split(rng)
+        p, f, r = init_fn(srng, *init_param, init_batch=init_batch)
+        p_chain.append(p)
+        f_chain.append(f)
+        r_chain.append(r)
+        if init_batch is not None:
+            init_batch, _ = f(p, init_batch, 0.)
+
+    def chain_forward(params, prev_sample, prev_logp=0.):
+        x, logp = prev_sample, prev_logp
+        for p, f in zip(params, f_chain):
+            x, logp = f(p, x, logp)
+        return x, logp
+
+    def chain_reverse(params, next_sample, next_logp=0.):
+        x, logp = next_sample, next_logp
+        for p, r in reversed(list(zip(params, r_chain))):
+            x, logp = r(p, x, logp)
+        return x, logp
+
+    return p_chain, chain_forward, chain_reverse
+
+
+"""
+Linear Real-NVP
+"""
+
 
 def init_nvp(rng, dim, flip, init_batch=None):
     net_init, net_apply = stax.serial(Dense(512), Relu, Dense(512), Relu, Dense(dim))
@@ -33,7 +75,7 @@ def init_nvp(rng, dim, flip, init_batch=None):
         s = net_apply(net_params, x1)
         return np.split(s, 2, axis=1)
 
-    def nvp_forward(net_params, prev_sample, prev_logp):
+    def nvp_forward(net_params, prev_sample, prev_logp=0.):
         d = dim // 2
         x1, x2 = prev_sample[:, :d], prev_sample[:, d:]
         if flip:
@@ -60,63 +102,62 @@ def init_nvp(rng, dim, flip, init_batch=None):
     return net_params, nvp_forward, nvp_reverse
 
 
-def init_flow_chain(rng, init_fns, init_params, init_batch=None):
-    assert len(init_fns) == len(init_params)
-    p_chain, f_chain, r_chain = [], [], []
-    for init_fn, init_param in zip(init_fns, init_params):
-        rng, srng = random.split(rng)
-        p, f, r = init_fn(srng, *init_param)
-        p_chain.append(p)
-        f_chain.append(f)
-        r_chain.append(r)
-        if init_batch is not None:
-            init_batch, _ = f(p, init_batch, 0.)
-
-    def chain_forward(params, prev_sample, prev_logp):
-        x, logp = prev_sample, prev_logp
-        for p, f in zip(params, f_chain):
-            x, logp = f(p, x, logp)
-        return x, logp
-
-    def chain_reverse(params, next_sample, next_logp=0.):
-        x, logp = next_sample, next_logp
-        for p, r in reversed(list(zip(params, r_chain))):
-            x, logp = r(p, x, logp)
-        return x, logp
-
-    return p_chain, chain_forward, chain_reverse
-
-
-def init_nvp_chain(rng, dim, n=2):
+def init_nvp_chain(rng, dim, n=2, init_batch=None, actnorm=False):
+    """Helper for making Real-NVP chains"""
     flip = False
     params = []
+    chain = []
     for _ in range(n):
+        if actnorm:
+            params.append(())
+            chain.append(init_actnorm)
+
         params.append((dim, flip))
+        chain.append(init_nvp)
+
         flip = not flip
-    return init_flow_chain(rng, [init_nvp for _ in range(n)], params)
+    return init_flow_chain(rng, chain, params, init_batch=init_batch)
 
 
-def make_log_prob_fn(reverse_fn, base_dist_log_prob):
+"""
+Linear Actnorm
+"""
+
+
+def init_actnorm(rng, init_batch=None):
+    assert init_batch is not None, "Actnorm requires data-dependent init"
+    mu, sig = np.mean(init_batch, axis=0), np.std(init_batch, axis=0)
+    log_scale = np.log(sig)
+    params = (mu, log_scale)
+
+    def actnorm_forward(params, prev_sample, prev_logp=0.):
+        mu, log_scale = params
+        y = (prev_sample - mu[None]) * np.exp(-log_scale)[None]
+        return y, prev_logp - np.sum(log_scale)
+
+    def actnorm_reverse(params, next_sample, next_logp=0.):
+        mu, log_scale = params
+        x = next_sample * np.exp(log_scale)[None] + mu[None]
+        return x, next_logp + np.sum(log_scale)
+
+    return params, actnorm_forward, actnorm_reverse
+
+
+"""
+Utilities to build functions for training and eval
+"""
+def make_log_prob_fn(forward_fn, base_dist_log_prob):
     def log_prob(p, x):
-        z, logp = reverse_fn(p, x)
+        z, logp = forward_fn(p, x)
         return base_dist_log_prob(z) + logp
     return log_prob
 
 
-def make_sample_fn(forward_fn, base_dist_sample):
+def make_sample_fn(reverse_fn, base_dist_sample):
     def sample(rng, p, n):
         z = base_dist_sample(rng, n)
-        return forward_fn(p, z, 0.0)[0]
+        return reverse_fn(p, z, 0.0)[0]
     return sample
-
-
-
-
-
-
-
-    
-
 
 
 if __name__ == "__main__":
@@ -132,13 +173,17 @@ if __name__ == "__main__":
     X, y = noisy_moons
     X = StandardScaler().fit_transform(X)
 
+    iters = int(1e5)
+    data_generator = (X[onp.random.choice(X.shape[0], 100)] for _ in range(iters))
+
     rng = random.PRNGKey(0)
 
     rng, srng = random.split(rng)
-    ps, forward_fn, reverse_fn = init_nvp_chain(srng, 2, n=4)
+    init_batch = next(data_generator)
+    ps, forward_fn, reverse_fn = init_nvp_chain(srng, 2, n=4, init_batch=init_batch, actnorm=True)
 
-    log_prob_fn = make_log_prob_fn(reverse_fn, log_prob_n01)
-    sample_fn = make_sample_fn(forward_fn, lambda rng, n: sample_n01(rng, (n, 2)))
+    log_prob_fn = make_log_prob_fn(forward_fn, log_prob_n01)
+    sample_fn = make_sample_fn(reverse_fn, lambda rng, n: sample_n01(rng, (n, 2)))
 
     def loss(params, batch):
         return -np.mean(log_prob_fn(params, batch))
@@ -153,8 +198,7 @@ if __name__ == "__main__":
         return opt_update(i, g, opt_state)
 
 
-    iters = int(1e5)
-    data_generator = (X[onp.random.choice(X.shape[0], 100)] for _ in range(iters))
+
     opt_state = opt_init(ps)
     for i in range(iters):
         x = next(data_generator)
