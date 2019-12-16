@@ -78,9 +78,9 @@ def init_factor_out(flow_params, flow_forward, flow_reverse, split_fn, rejoin_fn
         y_keep, y_factorout = split_fn(y)
         return y_keep, delta_logp, y_factorout
 
-    def factor_reverse(params, y_next, prev_logp=0., y_factorout=None):
+    def factor_reverse(params, y_next, next_logp=0., y_factorout=None):
         y = rejoin_fn(y_next, y_factorout)
-        return flow_reverse(params, y, prev_logp=prev_logp)
+        return flow_reverse(params, y, next_logp=next_logp)
 
     return flow_params, factor_forward, factor_reverse
 
@@ -98,7 +98,7 @@ def init_factor_out_chain(rng, init_fns, init_params, split_fn, rejoin_fn, init_
         if init_batch is not None:
             init_batch, _, __ = f(p, init_batch, 0.)
 
-    def chain_forward(params, prev_sample, prev_logp=0.):
+    def fo_chain_forward(params, prev_sample, prev_logp=0.):
         x_next, logp = prev_sample, prev_logp
         zs = []
         for p, f in zip(params, f_chain):
@@ -107,14 +107,14 @@ def init_factor_out_chain(rng, init_fns, init_params, split_fn, rejoin_fn, init_
         zs.append(x_next)
         return zs, logp
 
-    def chain_reverse(params, zs, next_logp=0.):
+    def fo_chain_reverse(params, zs, next_logp=0.):
         zs, z_next = zs[:-1], zs[-1]  # split off the final z
         logp = next_logp
         for p, r, z_factorout in reversed(list(zip(params, r_chain, zs))):
             z_next, logp = r(p, z_next, logp, z_factorout)
         return z_next, logp
 
-    return p_chain, chain_forward, chain_reverse
+    return p_chain, fo_chain_forward, fo_chain_reverse
 
 
 """
@@ -359,7 +359,7 @@ def init_multiscale_conv_flow(rng, in_shape, n_channels, n_blocks, n_steps, init
 
 
 """
-Utilities to build functions for training and eval
+Utilities to build functions for chain flows training and eval
 """
 
 
@@ -374,6 +374,26 @@ def make_sample_fn(reverse_fn, base_dist_sample):
     def sample(rng, p, n):
         z = base_dist_sample(rng, n)
         return reverse_fn(p, z, 0.)[0]
+    return sample
+
+
+"""
+Same shit for multi-scale flows
+"""
+
+
+def make_multiscale_log_prob_fn(forward_fn, base_dist_log_prob):
+    def log_prob(p, x):
+        zs, delta_logp = forward_fn(p, x)
+        logpz = np.sum([base_dist_log_prob(z) for z in zs], axis=0)
+        return logpz + delta_logp
+    return log_prob
+
+
+def make_multiscale_sample_fn(reverse_fn, base_dist_sample, shapes):
+    def sample(rng, p, n):
+        zs = [base_dist_sample(rng, (n,) + s) for s in shapes]
+        return reverse_fn(p, zs, 0.)[0]
     return sample
 
 
@@ -398,10 +418,19 @@ if __name__ == "__main__":
     #1/0
 
     rng, srng = random.split(rng)
-    ps, forward, reverse = init_multiscale_conv_flow(srng, (32, 32, 3), 64, 3, 20, init_batch=init_batch)
-    z, logp = forward(ps, init_batch)
-    for _z in z:
-        print(_z.shape)
+    ps, forward, reverse = init_multiscale_conv_flow(srng, (32, 32, 3), 64, 3, 2, init_batch=init_batch)
+    zs, logp = forward(ps, init_batch)
+    for z in zs:
+        print(z.shape)
+    z_shapes = [z.shape[1:] for z in zs]
+
+    log_prob_fn = make_multiscale_log_prob_fn(forward, log_prob_n01)
+    sample_fn = make_multiscale_sample_fn(reverse, sample_n01, z_shapes)
+
+    logpx = log_prob_fn(ps, init_batch)
+    sample = sample_fn(rng, ps, 12)
+    print(logpx.shape)
+    print(sample.shape)
     1/0
 
 
